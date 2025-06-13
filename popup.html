@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Audio Recorder</title>
+  <style>
+    body { font-family: sans-serif; width: 250px; padding: 10px; }
+    button { width: 100%; padding: 10px; margin-bottom: 10px; cursor: pointer; }
+    #status { margin-top: 10px; font-style: italic; }
+    label { display: block; margin-bottom: 10px; }
+    .mic-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .mic-status {
+      font-size: 12px;
+      color: #666;
+    }
+    .mic-status.granted { color: #4CAF50; }
+    .mic-status.denied { color: #ff9800; }
+    .settings-link {
+      font-size: 12px;
+      color: #2196F3;
+      text-decoration: underline;
+      cursor: pointer;
+      margin-left: 5px;
+    }
+    .settings-link:hover {
+      color: #1976D2;
+    }
+  </style>
+</head>
+<body>
+  <h3>Audio Recorder</h3>
+  <label class="mic-label">
+    <input type="checkbox" id="includeMicrophone"> 
+    <span>Include Microphone</span>
+    <span id="micStatus" class="mic-status"></span>
+  </label>
+  <div style="margin-bottom: 10px; font-size: 12px; color: #666;">
+    Need microphone access? <span id="settingsLink" class="settings-link">Open Settings</span>
+  </div>
+  <button id="startRecord">Start Recording</button>
+  <button id="stopRecord" style="display:none;">Stop Recording</button>
+  <div id="status">Ready to record.</div>
+  <script src="popup.js"></script>
+</body>
+</html>
