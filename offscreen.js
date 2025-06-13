@@ -31,6 +31,101 @@ chrome.runtime.onMessage.addListener(async (message) => {
   }
 });
 
+async function _getTabAudioStream(tabMediaStreamId) {
+  if (!tabMediaStreamId) {
+    console.warn("No tabMediaStreamId provided for tab capture.");
+    return null;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: 'tab',
+          chromeMediaSourceId: tabMediaStreamId
+        }
+      },
+      video: false
+    });
+    console.log("Tab stream captured in offscreen.");
+
+    // Restore playback
+    try {
+      playbackAudioContext = new AudioContext();
+      playbackSourceNode = playbackAudioContext.createMediaStreamSource(stream);
+      playbackSourceNode.connect(playbackAudioContext.destination);
+      console.log("Tab audio playback restored.");
+    } catch (playbackError) {
+      console.warn("Could not restore tab audio playback:", playbackError);
+    }
+    return stream;
+  } catch (error) {
+    console.error("Error getting tab audio stream:", error);
+    chrome.runtime.sendMessage({ type: 'OFFSCREEN_RECORDING_ERROR', error: `Tab audio capture failed: ${error.message}` });
+    return null;
+  }
+}
+
+async function _getMicrophoneStream() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    console.log("Mic stream captured in offscreen.");
+    return stream;
+  } catch (micError) {
+    console.error('Error accessing microphone:', micError);
+    let errorMessage = 'Microphone access failed.';
+    if (micError.name === 'NotAllowedError') {
+      errorMessage = 'Microphone permission denied. Please grant microphone access.';
+    } else if (micError.name === 'NotFoundError') {
+      errorMessage = 'No microphone found on your device.';
+    } else if (micError.name === 'NotReadableError') {
+      errorMessage = 'Microphone is being used by another application.';
+    }
+    // Send error message, but don't necessarily stop if tab audio is available.
+    // The main startRecording function will decide based on whether any stream was acquired.
+    chrome.runtime.sendMessage({ 
+        type: 'OFFSCREEN_RECORDING_ERROR', 
+        error: errorMessage 
+    });
+    return null;
+  }
+}
+
+function _combineAudioStreams(tabStream, micStream) {
+  if (!tabStream && !micStream) return null;
+  if (tabStream && !micStream) return tabStream;
+  if (!tabStream && micStream) return micStream;
+
+  audioContext = new AudioContext();
+  destinationNode = audioContext.createMediaStreamDestination();
+
+  tabSourceNode = audioContext.createMediaStreamSource(tabStream);
+  tabSourceNode.connect(destinationNode);
+
+  micSourceNode = audioContext.createMediaStreamSource(micStream);
+  micSourceNode.connect(destinationNode);
+
+  console.log("Streams combined via AudioContext.");
+  return destinationNode.stream;
+}
+
+function _setupMediaRecorder(stream, onDataAvailable, onStop, onError) {
+  const options = { mimeType: 'audio/webm;codecs=opus' };
+  if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+    console.warn(`${options.mimeType} is not supported, trying audio/ogg;codecs=opus`);
+    options.mimeType = 'audio/ogg;codecs=opus';
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      console.warn(`${options.mimeType} is not supported, trying default`);
+      options.mimeType = ''; // Let browser pick
+    }
+  }
+
+  const recorder = new MediaRecorder(stream, options);
+  recorder.ondataavailable = onDataAvailable;
+  recorder.onstop = onStop;
+  recorder.onerror = onError;
+  return recorder;
+}
+
 async function startRecording(tabMediaStreamId, includeMicrophone) {
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     console.warn('Recording already in progress.');
@@ -38,157 +133,77 @@ async function startRecording(tabMediaStreamId, includeMicrophone) {
   }
 
   audioChunks = []; // Reset chunks
-  const streamsToProcess = [];
+  originalTabStream = null;
+  originalMicStream = null;
 
   try {
-    // 1. Get Tab Audio Stream (using the ID from background.js)
-    if (tabMediaStreamId) {
-        originalTabStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                mandatory: {
-                    chromeMediaSource: 'tab', // Important: use 'tab' for tab audio
-                    chromeMediaSourceId: tabMediaStreamId
-                }
-            },
-            video: false
-        });
-        streamsToProcess.push(originalTabStream);
-        console.log("Tab stream captured in offscreen.");
-        
-        // Continue to play the captured audio to the user (Chrome mutes it by default during capture)
-        // This is the official solution from Chrome documentation
-        try {
-            playbackAudioContext = new AudioContext();
-            playbackSourceNode = playbackAudioContext.createMediaStreamSource(originalTabStream);
-            playbackSourceNode.connect(playbackAudioContext.destination);
-            console.log("Tab audio playback restored.");
-        } catch (playbackError) {
-            console.warn("Could not restore tab audio playback:", playbackError);
-            // Continue with recording even if playback fails
-        }
-    } else {
-        console.warn("No tabMediaStreamId provided for tab capture.");
-    }
+    originalTabStream = await _getTabAudioStream(tabMediaStreamId);
 
-
-    // 2. Get Microphone Stream (if requested)
     if (includeMicrophone) {
-      try {
-        originalMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        streamsToProcess.push(originalMicStream);
-        console.log("Mic stream captured in offscreen.");
-      } catch (micError) {
-        console.error('Error accessing microphone:', micError);
-        
-        // Provide more specific error message based on error type
-        let errorMessage = 'Microphone access failed.';
-        if (micError.name === 'NotAllowedError') {
-          errorMessage = 'Microphone permission denied. Please grant microphone access in the popup first.';
-        } else if (micError.name === 'NotFoundError') {
-          errorMessage = 'No microphone found on your device.';
-        } else if (micError.name === 'NotReadableError') {
-          errorMessage = 'Microphone is being used by another application.';
-        }
-        
-        // If we have tab audio, continue recording without microphone
-        if (originalTabStream) {
-          console.log('Continuing with tab audio only (microphone failed)');
-          chrome.runtime.sendMessage({ 
-            type: 'OFFSCREEN_RECORDING_ERROR', 
-            error: `${errorMessage} Recording will continue with tab audio only.` 
-          });
-          // Don't return - continue with tab audio only
-        } else {
-          // No streams available at all
-          chrome.runtime.sendMessage({ type: 'OFFSCREEN_RECORDING_ERROR', error: errorMessage });
-          cleanupStreamsAndContext(); 
-          return;
-        }
+      originalMicStream = await _getMicrophoneStream();
+      if (!originalMicStream && originalTabStream) {
+         // Mic failed, but tab stream is okay. User was already notified by _getMicrophoneStream.
+         // Inform that recording continues with tab audio only.
+         chrome.runtime.sendMessage({ 
+            type: 'OFFSCREEN_RECORDING_ERROR', // Using same type for simplicity, could be a 'warning' type
+            error: 'Microphone failed. Continuing with tab audio only.' 
+         });
       }
     }
 
-    if (streamsToProcess.length === 0) {
-      console.error('No streams to record.');
+    combinedStream = _combineAudioStreams(originalTabStream, originalMicStream);
+
+    if (!combinedStream) {
+      console.error('No streams available to record.');
+      // Error messages would have been sent by helper functions already for specific failures.
+      // This is a fallback if both somehow returned null without specific errors sent to user.
       chrome.runtime.sendMessage({ type: 'OFFSCREEN_RECORDING_ERROR', error: 'No audio sources available to record.' });
       cleanupStreamsAndContext();
       return;
     }
 
-    // 3. Combine Streams if multiple, or use single stream
-    if (streamsToProcess.length > 1) {
-      audioContext = new AudioContext();
-      destinationNode = audioContext.createMediaStreamDestination();
-
-      if (originalTabStream) {
-        tabSourceNode = audioContext.createMediaStreamSource(originalTabStream);
-        tabSourceNode.connect(destinationNode);
-      }
-      if (originalMicStream) {
-        micSourceNode = audioContext.createMediaStreamSource(originalMicStream);
-        micSourceNode.connect(destinationNode);
-      }
-      combinedStream = destinationNode.stream;
-      console.log("Streams combined via AudioContext.");
-    } else {
-      combinedStream = streamsToProcess[0]; // Single stream (either tab or mic)
-      console.log("Single stream being used.");
-    }
-
-    // 4. Setup MediaRecorder
-    const options = { mimeType: 'audio/webm;codecs=opus' };
-    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        console.warn(`${options.mimeType} is not supported, trying audio/ogg;codecs=opus`);
-        options.mimeType = 'audio/ogg;codecs=opus';
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            console.warn(`${options.mimeType} is not supported, trying default`);
-            options.mimeType = ''; // Let browser pick
+    mediaRecorder = _setupMediaRecorder(
+      combinedStream,
+      (event) => { // onDataAvailable
+        if (event.data.size > 0) {
+          audioChunks.push(event.data);
         }
-    }
+      },
+      () => { // onStop
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        const url = URL.createObjectURL(blob);
 
-    mediaRecorder = new MediaRecorder(combinedStream, options);
+        const a = document.createElement('a');
+        document.body.appendChild(a);
+        a.style.display = 'none';
+        a.href = url;
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        a.download = `recording-${timestamp}.${blob.type.split('/')[1].split(';')[0] || 'webm'}`;
+        a.click();
 
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        audioChunks.push(event.data);
-      }
-    };
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        audioChunks = [];
+        cleanupStreamsAndContext();
 
-    mediaRecorder.onstop = () => {
-      const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-      const url = URL.createObjectURL(blob);
-
-      // Offer download
-      const a = document.createElement('a');
-      document.body.appendChild(a); // Required for Firefox
-      a.style.display = 'none';
-      a.href = url;
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      a.download = `recording-${timestamp}.${blob.type.split('/')[1].split(';')[0] || 'webm'}`;
-      a.click();
-
-      // Clean up
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-      audioChunks = []; // Reset for next recording
-      cleanupStreamsAndContext();
-
-      // Inform background script that recording is complete and saved
-      chrome.runtime.sendMessage({ type: 'RECORDING_COMPLETE' });
-      console.log("Recording stopped, file processed and download triggered.");
-    };
-
-    mediaRecorder.onerror = (event) => {
+        chrome.runtime.sendMessage({ type: 'RECORDING_COMPLETE' });
+        console.log("Recording stopped, file processed and download triggered.");
+      },
+      (event) => { // onError
         console.error('MediaRecorder error:', event.error);
         chrome.runtime.sendMessage({ type: 'OFFSCREEN_RECORDING_ERROR', error: `MediaRecorder error: ${event.error.name}` });
         cleanupStreamsAndContext();
-    };
+      }
+    );
 
     mediaRecorder.start();
     console.log("MediaRecorder started.");
 
   } catch (error) {
-    console.error('Error during offscreen recording setup:', error);
-    chrome.runtime.sendMessage({ type: 'OFFSCREEN_RECORDING_ERROR', error: error.message });
+    // This catch is for unexpected errors in the orchestration logic itself.
+    // Specific stream acquisition or MediaRecorder errors are handled by helpers or their callbacks.
+    console.error('Error during offscreen recording orchestration:', error);
+    chrome.runtime.sendMessage({ type: 'OFFSCREEN_RECORDING_ERROR', error: `Core recording setup failed: ${error.message}` });
     cleanupStreamsAndContext();
   }
 }

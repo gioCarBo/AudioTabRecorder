@@ -30,6 +30,31 @@ async function closeOffscreenDocument() {
     }
 }
 
+// Helper function to reset recording state and clean up
+async function resetRecordingState(reasonMessage = 'Recording stopped.') {
+  console.log(`Resetting recording state: ${reasonMessage}`);
+  if (recordingTabId && await hasOffscreenDocument()) {
+    // If we were recording, tell offscreen to stop and clean up its resources.
+    // This assumes offscreen.js's OFFSCREEN_STOP_RECORDING handles cases where it might already be stopped.
+    chrome.runtime.sendMessage({
+      type: 'OFFSCREEN_STOP_RECORDING', // This will trigger its own cleanup and eventually RECORDING_COMPLETE or error
+      target: 'offscreen'
+    }).catch(err => console.log("Error sending stop to offscreen during reset, it might be closed already:", err.message));
+    // Note: offscreen.js will send 'RECORDING_COMPLETE' which then calls closeOffscreenDocument.
+    // However, if the stop was due to an error or tab closure, we might want to ensure cleanup sooner.
+    // For now, we rely on the existing flow, but if issues arise, direct call to closeOffscreenDocument here might be needed
+    // after a short delay or if OFFSCREEN_STOP_RECORDING fails to send.
+  } else if (await hasOffscreenDocument()) {
+    // If there was no active recordingTabId but an offscreen doc exists, it might be orphaned.
+    await closeOffscreenDocument();
+  }
+
+  recordingTabId = null;
+  streamId = null;
+  await chrome.storage.local.set({ isRecording: false });
+  updateExtensionIcon(false);
+  notifyPopupRecordingState(false, reasonMessage);
+}
 
 chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
   if (message.type === 'START_RECORDING') {
@@ -43,19 +68,8 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
 
     try {
       // 1. Get Tab Media Stream ID
-      // Note: chrome.tabCapture.capture requires the tab to be audible or recently audible.
-      // For a more robust solution, you might need to inject a content script to play a silent sound
-      // if the tab isn't making noise, but that's more complex.
-      // Here, we rely on the tab producing sound.
-      //
-      // An alternative is `chrome.desktopCapture` for entire screen audio,
-      // but `tabCapture` is more specific to the request.
-
-      // First, ensure the offscreen document is ready as it will receive the stream ID
       await setupOffscreenDocument();
 
-      // Get a media stream ID for the tab
-      // This stream ID will be used by the offscreen document to get the actual MediaStream
       const tabStream = await chrome.tabCapture.getMediaStreamId({
           targetTabId: recordingTabId,
       });
@@ -63,7 +77,7 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
       if (!tabStream) {
         throw new Error("Could not get tab media stream ID.");
       }
-      streamId = tabStream; // Save for potential re-use or stop
+      streamId = tabStream;
 
       // 2. Send request to offscreen document to start actual recording
       chrome.runtime.sendMessage({
@@ -80,13 +94,9 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
 
     } catch (error) {
       console.error('Error starting tab capture:', error);
-      recordingTabId = null;
-      streamId = null;
-      await chrome.storage.local.set({ isRecording: false });
-      updateExtensionIcon(false);
-      notifyPopupRecordingState(false, `Error: ${error.message}`);
+      await resetRecordingState(`Error: ${error.message}`); // Use centralized reset
       sendResponse({ success: false, error: error.message });
-      await closeOffscreenDocument(); // Clean up if failed
+      // closeOffscreenDocument is now handled by resetRecordingState if needed
     }
     return true; // Indicates an async response
 
@@ -102,40 +112,40 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
         type: 'OFFSCREEN_STOP_RECORDING',
         target: 'offscreen'
       });
-      // Offscreen document will send 'RECORDING_COMPLETE' when done
+      // Offscreen document will send 'RECORDING_COMPLETE' when done.
+      // The 'RECORDING_COMPLETE' handler will call closeOffscreenDocument.
 
-      // Reset state here, actual cleanup of offscreen will happen on RECORDING_COMPLETE
-      recordingTabId = null;
-      streamId = null;
-      await chrome.storage.local.set({ isRecording: false });
-      updateExtensionIcon(false);
-      notifyPopupRecordingState(false, 'Stopping recording...');
+      // Partially reset state here; full reset happens on RECORDING_COMPLETE or if error.
+      // We keep recordingTabId for a moment so onRemoved/onUpdated don't also try to stop.
+      // await chrome.storage.local.set({ isRecording: false }); // This is now done by resetRecordingState or RECORDING_COMPLETE path
+      // updateExtensionIcon(false); // Ditto
+      notifyPopupRecordingState(false, 'Stopping recording...'); // Inform UI immediately
+      // The actual isRecording state in storage will be set to false by RECORDING_COMPLETE handler or error handlers.
       sendResponse({ success: true });
 
     } catch (error) {
       console.error('Error stopping recording:', error);
+      await resetRecordingState(`Error stopping: ${error.message}`); // Use centralized reset on error
       sendResponse({ success: false, error: error.message });
     }
     return true; // Indicates an async response
 
   } else if (message.type === 'RECORDING_COMPLETE') {
     // This message comes from offscreen.js after file is saved
-    console.log("Recording complete and file saved. Closing offscreen document.");
-    await closeOffscreenDocument();
-    notifyPopupRecordingState(false, 'Recording saved! Ready for new recording.');
-    // No response needed for this notification
-    return false;
+    console.log("Recording complete and file saved.");
+    // Reset state now that offscreen is done and has (or will) save the file.
+    await resetRecordingState('Recording saved! Ready for new recording.');
+    // closeOffscreenDocument is called by resetRecordingState if offscreen was used or by offscreen.js itself.
+    // For clarity, ensure offscreen.js calls close on its own after saving and before sending this.
+    // Or, rely on resetRecordingState to handle closing the offscreen document.
+    // The `resetRecordingState` will handle setting storage, icon, and notifying popup.
+    return false; // No response needed for this notification
 
   } else if (message.type === 'OFFSCREEN_RECORDING_ERROR') {
     console.error("Error from offscreen document:", message.error);
-    recordingTabId = null;
-    streamId = null;
-    await chrome.storage.local.set({ isRecording: false });
-    updateExtensionIcon(false);
-    notifyPopupRecordingState(false, `Recording Error: ${message.error}`);
-    await closeOffscreenDocument();
-    // No response needed for this notification
-    return false;
+    await resetRecordingState(`Recording Error: ${message.error}`); // Use centralized reset
+    // closeOffscreenDocument is handled by resetRecordingState
+    return false; // No response needed for this notification
   }
   
   // Default: no response needed for unknown message types
@@ -171,37 +181,34 @@ function notifyPopupRecordingState(isRecording, statusText = '') {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (tabId === recordingTabId) {
     console.log("Recording tab closed. Stopping recording.");
-    if (await hasOffscreenDocument()){
-        chrome.runtime.sendMessage({ type: 'OFFSCREEN_STOP_RECORDING', target: 'offscreen' });
-    }
-    recordingTabId = null;
-    streamId = null;
-    await chrome.storage.local.set({ isRecording: false });
-    updateExtensionIcon(false);
-    notifyPopupRecordingState(false, 'Tab closed. Recording stopped.');
+    await resetRecordingState('Tab closed. Recording stopped.');
+    // The OFFSCREEN_STOP_RECORDING message and other cleanup is handled by resetRecordingState.
   }
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     if (tabId === recordingTabId && changeInfo.url) { // Navigated away
         console.log("Recording tab navigated. Stopping recording.");
-        if (await hasOffscreenDocument()){
-            chrome.runtime.sendMessage({ type: 'OFFSCREEN_STOP_RECORDING', target: 'offscreen' });
-        }
-        recordingTabId = null;
-        streamId = null;
-        await chrome.storage.local.set({ isRecording: false });
-        updateExtensionIcon(false);
-        notifyPopupRecordingState(false, 'Tab navigated. Recording stopped.');
+        await resetRecordingState('Tab navigated. Recording stopped.');
+        // The OFFSCREEN_STOP_RECORDING message and other cleanup is handled by resetRecordingState.
     }
 });
 
 // Initial state
 chrome.runtime.onStartup.addListener(async () => {
-    await chrome.storage.local.set({ isRecording: false });
-    updateExtensionIcon(false);
+    // Ensure a clean state on startup, especially if Chrome crashed during a recording.
+    await resetRecordingState('Extension startup; ensuring clean state.');
+    // Set default for microphone permission if not already set (optional)
+    const checkPerm = await chrome.storage.local.get('microphonePermissionGranted');
+    if (checkPerm.microphonePermissionGranted === undefined) {
+        await chrome.storage.local.set({ microphonePermissionGranted: false });
+    }
 });
-chrome.runtime.onInstalled.addListener(async () => {
-    await chrome.storage.local.set({ isRecording: false });
-    updateExtensionIcon(false);
+chrome.runtime.onInstalled.addListener(async (details) => {
+    await resetRecordingState('Extension installed/updated; ensuring clean state.');
+    // Set default for microphone permission on first install
+    if (details.reason === 'install') {
+        await chrome.storage.local.set({ microphonePermissionGranted: false });
+    }
+    // If updating, you might want to preserve existing settings or handle migrations.
 });

@@ -15,7 +15,7 @@ function updateMicrophoneStatus() {
       micStatus.textContent = '[OK] Granted';
       micStatus.className = 'mic-status granted';
     } else {
-      micStatus.textContent = '⚠ Setup needed';
+      micStatus.textContent = '⚠ Setup needed'; // Clearly indicate setup is needed
       micStatus.className = 'mic-status denied';
     }
   } else {
@@ -92,9 +92,13 @@ startButton.addEventListener('click', async () => {
   
   // Check microphone permission if microphone is requested
   if (includeMicrophone) {
-    const hasPermission = await checkMicrophonePermission();
-    if (!hasPermission) {
-      statusDiv.textContent = 'Microphone permission required. Please enable microphone access.';
+    // Re-check permission status directly here as it's critical for starting
+    const stored = await chrome.storage.local.get(['microphonePermissionGranted']);
+    microphonePermissionGranted = stored.microphonePermissionGranted || false;
+
+    if (!microphonePermissionGranted) {
+      statusDiv.textContent = 'Microphone permission needed. Open Settings to grant.';
+      updateMicrophoneStatus(); // Ensure mic status reflects this
       return;
     }
   }
@@ -154,31 +158,25 @@ stopButton.addEventListener('click', () => {
 // Handle settings link click
 settingsLink.addEventListener('click', openOptionsPage);
 
-// Handle microphone checkbox changes - guide user to options page for permission
+// Handle microphone checkbox changes
 micCheckbox.addEventListener('change', async () => {
-  if (micCheckbox.checked) {
-    // Check if permission is already granted
-    const hasPermission = await checkMicrophonePermission();
-    if (!hasPermission) {
-      // Guide user to options page for permission setup
-      statusDiv.textContent = 'Opening settings to setup microphone permission...';
-      setTimeout(() => {
-        openOptionsPage();
-        // Uncheck for now since permission not granted yet
-        micCheckbox.checked = false;
-        statusDiv.textContent = 'Grant microphone permission in the settings tab, then try again.';
-      }, 500);
-      await chrome.storage.local.set({ includeMicrophone: false });
+  const includeMic = micCheckbox.checked;
+  await chrome.storage.local.set({ includeMicrophone: includeMic });
+
+  if (includeMic) {
+    // Check current permission status (might have been granted in another tab)
+    const stored = await chrome.storage.local.get(['microphonePermissionGranted']);
+    microphonePermissionGranted = stored.microphonePermissionGranted || false;
+
+    if (!microphonePermissionGranted) {
+      statusDiv.textContent = 'Microphone access needed. Open Settings to grant.';
     } else {
-      await chrome.storage.local.set({ includeMicrophone: true });
       statusDiv.textContent = 'Ready to record with microphone.';
     }
   } else {
-    // Checkbox unchecked - save preference
-    await chrome.storage.local.set({ includeMicrophone: false });
     statusDiv.textContent = 'Ready to record.';
   }
-  updateMicrophoneStatus();
+  updateMicrophoneStatus(); // Update mic status display regardless
 });
 
 // Listen for state changes from background script
@@ -197,10 +195,17 @@ chrome.runtime.onMessage.addListener((message) => {
 chrome.storage.onChanged.addListener((changes, namespace) => {
   if (namespace === 'local' && changes.microphonePermissionGranted) {
     microphonePermissionGranted = changes.microphonePermissionGranted.newValue;
-    updateMicrophoneStatus();
-    if (microphonePermissionGranted && micCheckbox.checked) {
+    // If the checkbox is currently checked and permission was just granted,
+    // update the main status message.
+    if (micCheckbox.checked && microphonePermissionGranted) {
       statusDiv.textContent = 'Microphone permission granted! Ready to record.';
     }
+    updateMicrophoneStatus(); // Always update the dedicated mic status indicator
+  }
+  // Also listen for changes to isRecording, e.g. if background stops it
+  if (namespace === 'local' && changes.isRecording) {
+    isRecording = changes.isRecording.newValue;
+    updateUI(); // This will re-evaluate button states and status text
   }
 });
 
